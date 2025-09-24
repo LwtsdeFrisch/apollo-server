@@ -21,7 +21,6 @@ import {
   type GraphQLSchema,
   type ParseOptions,
   type TypedQueryDocumentNode,
-  type ValidationContext,
   type ValidationRule,
 } from 'graphql';
 import loglevel from 'loglevel';
@@ -33,10 +32,7 @@ import {
   ensureGraphQLError,
   normalizeAndFormatErrors,
 } from './errorNormalize.js';
-import {
-  ApolloServerErrorCode,
-  ApolloServerValidationErrorCode,
-} from './errors/index.js';
+import { ApolloServerErrorCode } from './errors/index.js';
 import type { ApolloServerOptionsWithStaticSchema } from './externalTypes/constructor.js';
 import type {
   ExecuteOperationOptions,
@@ -75,25 +71,31 @@ import { computeCoreSchemaHash } from './utils/computeCoreSchemaHash.js';
 import { isDefined } from './utils/isDefined.js';
 import { SchemaManager } from './utils/schemaManager.js';
 import type { GraphQLExecutor } from './externalTypes/requestPipeline.js';
+import {
+  NoIntrospection,
+  createMaxRecursiveSelectionsRule,
+  DEFAULT_MAX_RECURSIVE_SELECTIONS,
+} from './validationRules/index.js';
 
-const NoIntrospection: ValidationRule = (context: ValidationContext) => ({
-  Field(node) {
-    if (node.name.value === '__schema' || node.name.value === '__type') {
-      context.reportError(
-        new GraphQLError(
-          'GraphQL introspection is not allowed by Apollo Server, but the query contained __schema or __type. To enable introspection, pass introspection: true to ApolloServer in production',
-          {
-            nodes: [node],
-            extensions: {
-              validationErrorCode:
-                ApolloServerValidationErrorCode.INTROSPECTION_DISABLED,
-            },
-          },
-        ),
-      );
-    }
-  },
-});
+// const NoIntrospection: ValidationRule = (context: ValidationContext) => ({
+//   Field(node) {
+//     if (node.name.value === '__schema' || node.name.value === '__type') {
+//       context.reportError(
+//         new GraphQLError(
+//           'GraphQL introspection is not allowed by Apollo Server, but the query contained __schema or __type. To enable introspection, pass introspection: true to ApolloServer in production',
+//           {
+//             nodes: [node],
+//             extensions: {
+//               validationErrorCode:
+//                 ApolloServerValidationErrorCode.INTROSPECTION_DISABLED,
+//             },
+//           },
+//         ),
+//       );
+//     }
+//   },
+// });
+
 
 export type SchemaDerivedData = {
   schema: GraphQLSchema;
@@ -116,42 +118,42 @@ type RunningServerState = {
 
 type ServerState =
   | {
-      phase: 'initialized';
-      schemaManager: SchemaManager;
-    }
+    phase: 'initialized';
+    schemaManager: SchemaManager;
+  }
   | {
-      phase: 'starting';
-      barrier: Resolvable<void>;
-      schemaManager: SchemaManager;
-      // This is set to true if you called
-      // startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests
-      // instead of start. The main purpose is that assertStarted allows you to
-      // still be in the starting phase if this is set. (This is the serverless
-      // use case.)
-      startedInBackground: boolean;
-    }
+    phase: 'starting';
+    barrier: Resolvable<void>;
+    schemaManager: SchemaManager;
+    // This is set to true if you called
+    // startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests
+    // instead of start. The main purpose is that assertStarted allows you to
+    // still be in the starting phase if this is set. (This is the serverless
+    // use case.)
+    startedInBackground: boolean;
+  }
   | {
-      phase: 'failed to start';
-      error: Error;
-    }
+    phase: 'failed to start';
+    error: Error;
+  }
   | ({
-      phase: 'started';
-      drainServers: (() => Promise<void>) | null;
-      toDispose: (() => Promise<void>)[];
-      toDisposeLast: (() => Promise<void>)[];
-    } & RunningServerState)
+    phase: 'started';
+    drainServers: (() => Promise<void>) | null;
+    toDispose: (() => Promise<void>)[];
+    toDisposeLast: (() => Promise<void>)[];
+  } & RunningServerState)
   | ({
-      phase: 'draining';
-      barrier: Resolvable<void>;
-    } & RunningServerState)
+    phase: 'draining';
+    barrier: Resolvable<void>;
+  } & RunningServerState)
   | {
-      phase: 'stopping';
-      barrier: Resolvable<void>;
-    }
+    phase: 'stopping';
+    barrier: Resolvable<void>;
+  }
   | {
-      phase: 'stopped';
-      stopError: Error | null;
-    };
+    phase: 'stopped';
+    stopError: Error | null;
+  };
 
 export interface ApolloServerInternals<TContext extends BaseContext> {
   state: ServerState;
@@ -176,10 +178,10 @@ export interface ApolloServerInternals<TContext extends BaseContext> {
 
   rootValue?: ((parsedQuery: DocumentNode) => unknown) | unknown;
   validationRules: Array<ValidationRule>;
+  laterValidationRules?: Array<ValidationRule>;
   hideSchemaDetailsFromClientErrors: boolean;
   fieldResolver?: GraphQLFieldResolver<any, TContext>;
-  // TODO(AS5): remove OR warn + ignore with this option set, ignore option and
-  // flip default behavior.
+  // TODO(AS6): remove this option.
   status400ForVariableCoercionErrors?: boolean;
   __testing_incrementalExecutionResults?: GraphQLExperimentalIncrementalExecutionResults;
   stringifyResult: (
@@ -237,58 +239,58 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
     ) {
       throw new Error(
         'You cannot pass a cache returned from ' +
-          '`PrefixingKeyValueCache.cacheDangerouslyDoesNotNeedPrefixesForIsolation`' +
-          'to `new ApolloServer({ cache })`, because Apollo Server may use it for ' +
-          'multiple features whose cache keys must be distinct from each other.',
+        '`PrefixingKeyValueCache.cacheDangerouslyDoesNotNeedPrefixesForIsolation`' +
+        'to `new ApolloServer({ cache })`, because Apollo Server may use it for ' +
+        'multiple features whose cache keys must be distinct from each other.',
       );
     }
 
     if (config.gateway && config.customExecutor) {
       throw new Error(
         'You cannot specify both config.gateway and config.customExecutor' +
-          'because they are mutually exclusive.',
+        'because they are mutually exclusive.',
       );
     }
 
     const state: ServerState = config.gateway
       ? // ApolloServer has been initialized but we have not yet tried to load the
-        // schema from the gateway. That will wait until `start()` or
-        // `startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests()`
-        // is called. (These may be called by other helpers; for example,
-        // `standaloneServer` calls `start` for you inside its `listen` method,
-        // and a serverless framework integration would call
-        // startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests
-        // for you.)
-        {
-          phase: 'initialized',
-          schemaManager: new SchemaManager({
-            gateway: config.gateway,
-            apolloConfig,
-            schemaDerivedDataProvider: (schema) =>
-              ApolloServer.generateSchemaDerivedData(
-                schema,
-                config.documentStore,
-              ),
-            logger: this.logger,
-          }),
-        }
+      // schema from the gateway. That will wait until `start()` or
+      // `startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests()`
+      // is called. (These may be called by other helpers; for example,
+      // `standaloneServer` calls `start` for you inside its `listen` method,
+      // and a serverless framework integration would call
+      // startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests
+      // for you.)
+      {
+        phase: 'initialized',
+        schemaManager: new SchemaManager({
+          gateway: config.gateway,
+          apolloConfig,
+          schemaDerivedDataProvider: (schema) =>
+            ApolloServer.generateSchemaDerivedData(
+              schema,
+              config.documentStore,
+            ),
+          logger: this.logger,
+        }),
+      }
       : // We construct the schema synchronously so that we can fail fast if the
-        // schema can't be constructed. (This used to be more important because we
-        // used to have a 'schema' field that was publicly accessible immediately
-        // after construction, though that field never actually worked with
-        // gateways.)
-        {
-          phase: 'initialized',
-          schemaManager: new SchemaManager({
-            apiSchema: ApolloServer.constructSchema(config),
-            schemaDerivedDataProvider: (schema) =>
-              ApolloServer.generateSchemaDerivedData(
-                schema,
-                config.documentStore,
-              ),
-            logger: this.logger,
-          }),
-        };
+      // schema can't be constructed. (This used to be more important because we
+      // used to have a 'schema' field that was publicly accessible immediately
+      // after construction, though that field never actually worked with
+      // gateways.)
+      {
+        phase: 'initialized',
+        schemaManager: new SchemaManager({
+          apiSchema: ApolloServer.constructSchema(config),
+          schemaDerivedDataProvider: (schema) =>
+            ApolloServer.generateSchemaDerivedData(
+              schema,
+              config.documentStore,
+            ),
+          logger: this.logger,
+        }),
+      };
 
     const introspectionEnabled = config.introspection ?? isDev;
     const hideSchemaDetailsFromClientErrors =
@@ -301,15 +303,35 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         ? new InMemoryLRUCache()
         : config.cache;
 
+    // Check whether the recursive selections limit has been enabled (off by
+    // default), or whether a custom limit has been specified.
+    const maxRecursiveSelectionsRule =
+      config.maxRecursiveSelections === true
+        ? [createMaxRecursiveSelectionsRule(DEFAULT_MAX_RECURSIVE_SELECTIONS)]
+        : typeof config.maxRecursiveSelections === 'number'
+          ? [createMaxRecursiveSelectionsRule(config.maxRecursiveSelections)]
+          : [];
+
+    // If the recursive selections rule has been enabled, then run configured
+    // validations in a later validate() pass.
+    const validationRules = [
+      ...(introspectionEnabled ? [] : [NoIntrospection]),
+      ...maxRecursiveSelectionsRule,
+    ];
+    let laterValidationRules;
+    if (maxRecursiveSelectionsRule.length > 0) {
+      laterValidationRules = config.validationRules;
+    } else {
+      validationRules.push(...(config.validationRules ?? []));
+    }
+
     // Note that we avoid calling methods on `this` before `this.internals` is assigned
     // (thus a bunch of things being static methods above).
     this.internals = {
       formatError: config.formatError,
       rootValue: config.rootValue,
-      validationRules: [
-        ...(config.validationRules ?? []),
-        ...(introspectionEnabled ? [] : [NoIntrospection]),
-      ],
+      validationRules,
+      laterValidationRules,
       hideSchemaDetailsFromClientErrors,
       dangerouslyDisableValidation:
         config.dangerouslyDisableValidation ?? false,
@@ -321,12 +343,12 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         config.persistedQueries === false
           ? undefined
           : {
-              ...config.persistedQueries,
-              cache: new PrefixingKeyValueCache(
-                config.persistedQueries?.cache ?? this.cache,
-                APQ_CACHE_PREFIX,
-              ),
-            },
+            ...config.persistedQueries,
+            cache: new PrefixingKeyValueCache(
+              config.persistedQueries?.cache ?? this.cache,
+              APQ_CACHE_PREFIX,
+            ),
+          },
       nodeEnv,
       allowBatchedHttpRequests: config.allowBatchedHttpRequests ?? false,
       apolloConfig,
@@ -349,11 +371,30 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
             : (config.csrfPrevention.requestHeaders ??
               recommendedCsrfPreventionRequestHeaders),
       status400ForVariableCoercionErrors:
-        config.status400ForVariableCoercionErrors ?? false,
+        config.status400ForVariableCoercionErrors ?? true,
       __testing_incrementalExecutionResults:
         config.__testing_incrementalExecutionResults,
       stringifyResult: config.stringifyResult ?? prettyJSONStringify,
     };
+
+    this.warnAgainstDeprecatedConfigOptions(config);
+  }
+
+  private warnAgainstDeprecatedConfigOptions(
+    config: ApolloServerOptions<TContext>,
+  ) {
+    // TODO(AS6): this option goes away altogether. We should either update or remove this warning.
+    if ('status400ForVariableCoercionErrors' in config) {
+      if (config.status400ForVariableCoercionErrors === true) {
+        this.logger.warn(
+          'The `status400ForVariableCoercionErrors: true` configuration option is now the default behavior and has no effect in Apollo Server v5. You can safely remove this option from your configuration.',
+        );
+      } else {
+        this.logger.warn(
+          'The `status400ForVariableCoercionErrors: false` configuration option is deprecated and will be removed in Apollo Server v6. Apollo recommends removing any dependency on this behavior.',
+        );
+      }
+    }
   }
 
   // Awaiting a call to `start` ensures that a schema has been loaded and that
@@ -396,8 +437,8 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
       // all.
       throw new Error(
         `You should only call 'start()' or ` +
-          `'startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests()' ` +
-          `once on your ApolloServer.`,
+        `'startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests()' ` +
+        `once on your ApolloServer.`,
       );
     }
     const schemaManager = this.internals.state.schemaManager;
@@ -474,10 +515,10 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         .filter(isDefined);
       const drainServers = drainServerCallbacks.length
         ? async () => {
-            await Promise.all(
-              drainServerCallbacks.map((drainServer) => drainServer()),
-            );
-          }
+          await Promise.all(
+            drainServerCallbacks.map((drainServer) => drainServer()),
+          );
+        }
         : null;
 
       // Find the renderLandingPage callback, if one is provided. If the user
@@ -642,14 +683,13 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         case 'stopped':
           this.logger.warn(
             'A GraphQL operation was received during server shutdown. The ' +
-              'operation will fail. Consider draining the HTTP server on shutdown; ' +
-              'see https://go.apollo.dev/s/drain for details.',
+            'operation will fail. Consider draining the HTTP server on shutdown; ' +
+            'see https://go.apollo.dev/s/drain for details.',
           );
           throw new Error(
-            `Cannot execute GraphQL operations ${
-              this.internals.state.phase === 'stopping'
-                ? 'while the server is stopping'
-                : 'after the server has stopped'
+            `Cannot execute GraphQL operations ${this.internals.state.phase === 'stopping'
+              ? 'while the server is stopping'
+              : 'after the server has stopped'
             }.'`,
           );
         default:
@@ -684,8 +724,8 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
     ) {
       throw new Error(
         'You must `await server.start()` before calling `' +
-          expressionForError +
-          '`',
+        expressionForError +
+        '`',
       );
     }
   }
@@ -700,8 +740,8 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
   private logStartupError(err: Error) {
     this.logger.error(
       'An error occurred during Apollo Server startup. All GraphQL requests ' +
-        'will now fail. The startup error was: ' +
-        (err?.message || err),
+      'will now fail. The startup error was: ' +
+      (err?.message || err),
     );
   }
 
@@ -892,9 +932,9 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         if (seen.sawDisabled && seen.sawNonDisabled) {
           throw new Error(
             `You have tried to install both ApolloServerPlugin${id} and ` +
-              `ApolloServerPlugin${id}Disabled in your server. Please choose ` +
-              `whether or not you want to disable the feature and install the ` +
-              `appropriate plugin for your use case.`,
+            `ApolloServerPlugin${id}Disabled in your server. Please choose ` +
+            `whether or not you want to disable the feature and install the ` +
+            `appropriate plugin for your use case.`,
           );
         }
       }
@@ -931,9 +971,9 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         } else {
           this.logger.warn(
             'You have specified an Apollo key but have not specified a graph ref; usage ' +
-              'reporting is disabled. To enable usage reporting, set the `APOLLO_GRAPH_REF` ' +
-              'environment variable to `your-graph-id@your-graph-variant`. To disable this ' +
-              'warning, install `ApolloServerPluginUsageReportingDisabled`.',
+            'reporting is disabled. To enable usage reporting, set the `APOLLO_GRAPH_REF` ' +
+            'environment variable to `your-graph-id@your-graph-variant`. To disable this ' +
+            'warning, install `ApolloServerPluginUsageReportingDisabled`.',
           );
         }
       }
@@ -953,9 +993,9 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
         } else {
           throw new Error(
             "You've enabled schema reporting by setting the APOLLO_SCHEMA_REPORTING " +
-              'environment variable to true, but you also need to provide your ' +
-              'Apollo API key, via the APOLLO_KEY environment ' +
-              'variable or via `new ApolloServer({apollo: {key})',
+            'environment variable to true, but you also need to provide your ' +
+            'Apollo API key, via the APOLLO_KEY environment ' +
+            'variable or via `new ApolloServer({apollo: {key})',
           );
         }
       }
@@ -1169,7 +1209,7 @@ export class ApolloServer<in out TContext extends BaseContext = BaseContext> {
           // it's probably more useful for them to fix the other error before
           // they deal with the `accept` header.
           chooseContentTypeForSingleResultResponse(requestHead) ??
-            MEDIA_TYPES.APPLICATION_JSON,
+          MEDIA_TYPES.APPLICATION_JSON,
         ],
       ]),
       body: {
